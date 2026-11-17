@@ -1,103 +1,71 @@
 /**
- * btc-race-24h entry: EMA crossover with RSI filter.
- *
- * Strategy:
- *   - Track fast EMA (4 bars) and slow EMA (12 bars) of CBBTC close prices.
- *   - Buy when fast crosses above slow AND RSI < 70 (not overbought).
- *   - Sell when fast crosses below slow OR position drawdown exceeds 8%.
- *   - Start with 95% equity allocation, long only, 1 position max.
- *
- * Designed for 1-minute bars on a single asset (CBBTC/USDC).
- * Uses the vendor makefun-bars SDK for protocol handling.
+ * btc-race-24h entry: EMA crossover with RSI confirmation.
+ * Strategy: buy when fast EMA crosses above slow EMA + RSI < 70,
+ *           sell on cross-down or 8% max drawdown.
+ * Long only, single asset (CBBTC), 1 position max.
  */
-import { runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
+import { BPS, runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
 
-const FAST_EMA = 4;
-const SLOW_EMA = 12;
-const RSI_PERIOD = 14;
-const RSI_OVERBOUGHT = 70;
-const MAX_DRAWDOWN_BPS = 800; // 8%
-const ALLOC_PCT = 95;
-const MAX_SLIPPAGE_BPS = 100;
+const FAST = 6, SLOW = 18, RSI_PER = 14;
+const RSI_OVER = 70, MAX_DD_BPS = 800, MAX_SLIP = 100;
 
-// State
-let emaFast = 0;
-let emaSlow = 0;
-let prevFast = 0;
-let prevSlow = 0;
 let closes: number[] = [];
-let entryPrice = 0;
-let prevClose = 0;
+let fast = 0, slow = 0, pfast = 0, pslow = 0;
+let entry = 0;
+let scale = 0;
 
 function rsi(): number {
-  if (closes.length < RSI_PERIOD + 1) return 50;
-  let gains = 0, losses = 0;
-  for (let i = closes.length - RSI_PERIOD; i < closes.length; i++) {
-    const delta = closes[i] - closes[i - 1];
-    if (delta > 0) gains += delta; else losses -= delta;
+  if (closes.length < RSI_PER + 1) return 50;
+  let g = 0, l = 0;
+  for (let i = closes.length - RSI_PER; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) g += d; else l -= d;
   }
-  const avgGain = gains / RSI_PERIOD;
-  const avgLoss = losses / RSI_PERIOD;
-  if (avgLoss === 0) return 100;
-  return 100 - (100 / (1 + avgGain / avgLoss));
+  if (l === 0) return 100;
+  return 100 - 100 / (1 + (g / RSI_PER) / (l / RSI_PER));
 }
 
 await runBars({
-  onBatch(state: BarsState, batch): OrderInput[] {
-    const bar = state.bar('CBBTC');
-    if (!bar) return [];
+  onBatch(state: BarsState): OrderInput[] {
+    const raw = state.close('CBBTC');
+    if (raw === null) return [];
+    if (scale === 0) {
+      const s = state.hello.symbols.find(x => x.symbol === 'CBBTC');
+      scale = s?.price_scale ?? 0;
+    }
+    const c = Number(raw) / (10 ** scale);
+    closes.push(c);
+    if (closes.length > 200) closes = closes.slice(-200);
 
-    const close = Number(bar.c) / (10 ** (state.hello.symbols[0]?.price_scale ?? 0));
-    closes.push(close);
-    if (closes.length > RSI_PERIOD * 3) closes = closes.slice(-RSI_PERIOD * 3);
-
-    // EMA updates
-    const kFast = 2 / (FAST_EMA + 1);
-    const kSlow = 2 / (SLOW_EMA + 1);
-    prevFast = emaFast;
-    prevSlow = emaSlow;
-    emaFast = emaFast === 0 ? close : close * kFast + emaFast * (1 - kFast);
-    emaSlow = emaSlow === 0 ? close : close * kSlow + emaSlow * (1 - kSlow);
-    prevClose = close;
+    const kf = 2 / (FAST + 1), ks = 2 / (SLOW + 1);
+    pfast = fast; pslow = slow;
+    fast = fast === 0 ? c : c * kf + fast * (1 - kf);
+    slow = slow === 0 ? c : c * ks + slow * (1 - ks);
 
     const orders: OrderInput[] = [];
-    const hasPosition = state.positions.size > 0;
+    const inPos = state.positions.has('CBBTC');
+    const ready = closes.length >= SLOW + 2;
 
-    if (!hasPosition && closes.length >= SLOW_EMA + 2) {
-      const crossUp = prevFast <= prevSlow && emaFast > emaSlow;
-      const rsiVal = rsi();
-      if (crossUp && rsiVal < RSI_OVERBOUGHT) {
-        const cash = Number(state.cash) / 1_000_000; // micro-USDC to USDC
-        const spend = BigInt(Math.floor(cash * ALLOC_PCT / 100 * 1_000_000));
+    if (!inPos && ready && !state.warmingUp) {
+      const cross = pfast <= pslow && fast > pslow;
+      if (cross && rsi() < RSI_OVER) {
+        const spend = (state.cash * 95n) / 100n;
         if (spend >= BigInt(state.hello.fees.min_notional_quote_units)) {
-          orders.push({
-            side: 'buy',
-            symbol: 'CBBTC',
-            notional_quote_units: spend,
-            max_slippage_bps: MAX_SLIPPAGE_BPS,
-          });
-          entryPrice = close;
+          orders.push({ side: 'buy', symbol: 'CBBTC', notional_quote_units: spend, max_slippage_bps: MAX_SLIP });
+          entry = c;
         }
       }
     }
-
-    if (hasPosition) {
-      const crossDown = prevFast >= prevSlow && emaFast < emaSlow;
-      const drawdownBps = entryPrice > 0 ? (close - entryPrice) / entryPrice * 10000 : 0;
-      const exit = crossDown || drawdownBps < -MAX_DRAWDOWN_BPS;
-      if (exit) {
-        const pos = [...state.positions.values()][0];
+    if (inPos) {
+      const cross = pfast >= pslow && fast < pslow;
+      const dd = entry > 0 ? (c - entry) / entry * 10000 : 0;
+      if (cross || dd < -MAX_DD_BPS) {
+        const pos = state.positions.get('CBBTC');
         if (pos) {
-          orders.push({
-            side: 'sell',
-            symbol: 'CBBTC',
-            qty: pos.qty,
-            max_slippage_bps: MAX_SLIPPAGE_BPS,
-          });
+          orders.push({ side: 'sell', symbol: 'CBBTC', qty: pos.qty, max_slippage_bps: MAX_SLIP });
         }
       }
     }
-
     return orders;
   },
 });
